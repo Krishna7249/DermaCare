@@ -7,15 +7,84 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 import requests
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import load_img, img_to_array 
+import numpy as np
+from PIL import Image
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})
 
+# Initialize Firebase
 cred = credentials.Certificate("skindiseasedetection-d25eb-firebase-adminsdk-fbsvc-abe639d9d4.json")
 firebase_admin.initialize_app(cred)
 
+# Load model
+MODEL_PATH = "final_derma_model.h5"
+model = tf.keras.models.load_model(MODEL_PATH)
+
+# Load environment variables
 load_dotenv()
 
+# Disease prediction labels
+class_labels = [
+    'actinic_keratosis', 'atopic_dermatitis', 'benign_keratosis',
+    'dermatofibroma', 'melanocytic_nevus', 'melanoma',
+    'squamous_cell_carcinoma', 'tinea_ringworm_candidiasis', 'vascular_lesion'
+]
+
+# Disease recommendations
+disease_recommendations = {
+    'actinic_keratosis': 'Protect skin from the sun, use prescribed creams, and visit a dermatologist regularly.',
+    'atopic_dermatitis': 'Use mild skincare products, avoid allergens, and keep skin hydrated.',
+    'benign_keratosis': 'Typically harmless. Consult a doctor if they become irritated.',
+    'dermatofibroma': 'Usually harmless, but if it changes or becomes painful, see a dermatologist.',
+    'melanocytic_nevus': 'Monitor for any changes in shape, color, or size.',
+    'melanoma': 'Consult a dermatologist immediately. Early detection is key!',
+    'squamous_cell_carcinoma': 'Seek medical treatment immediately. Early treatment is crucial.',
+    'tinea_ringworm_candidiasis': 'Use antifungal creams and keep the area dry.',
+    'vascular_lesion': 'Consult a dermatologist for appropriate treatment options.'
+}
+
+# Preprocess the uploaded image before prediction
+def preprocess_image(image):
+    IMG_SIZE = (224, 224)  # Same size as used in training
+    image = image.convert("RGB")  # Convert to RGB if not already
+    print(image.mode)
+    image = image.resize(IMG_SIZE)  # Resize the image
+    image = np.array(image) / 255.0  # Normalize the image
+    image = np.expand_dims(image, axis=0)  # Add a batch dimension
+    return image
+
+# Predict disease
+def predict_disease(img):
+    img = preprocess_image(img)  # Preprocess the image
+    prediction = model.predict(img)  # Predict the disease
+    class_idx = np.argmax(prediction)
+    class_label = class_labels[class_idx]
+    recommendation = disease_recommendations.get(class_label, "Consult a dermatologist.")
+    
+    return class_label, recommendation
+
+@app.route("/disease-detection", methods=["POST"])
+def disease_detection():
+    try:
+        # Get the image from the request
+        file = request.files['image']
+        if file:
+            img = Image.open(file)
+            # Make a prediction
+            disease, recommendation = predict_disease(img)
+
+            # Return the prediction
+            return jsonify({"predicted_condition": disease, "recommendation": recommendation}), 200
+        else:
+            return jsonify({"error": "No image provided"}), 400
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Gemini AI client setup
 api_key = os.environ.get("GEMINI_API_KEY")
 if not api_key:
     raise ValueError("GEMINI_API_KEY is not set.")
@@ -42,15 +111,11 @@ def ai_response():
     contents = [
         types.Content(
             role="model",
-            parts=[
-                types.Part.from_text(text=system_instruction),
-            ],
+            parts=[types.Part.from_text(text=system_instruction)],
         ),
         types.Content(
             role="user",
-            parts=[
-                types.Part.from_text(text=user_input),
-            ],
+            parts=[types.Part.from_text(text=user_input)],
         ),
     ]
     
@@ -85,7 +150,7 @@ def signup():
         name = data.get("name")
 
         user = auth.create_user(email=email, password=password)
-        return jsonify({"message": "User  created successfully", "uid": user.uid}), 201
+        return jsonify({"message": "User created successfully", "uid": user.uid}), 201
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -97,7 +162,7 @@ def login():
         email = data.get("email")
         password = data.get("password")
 
-        return jsonify({"message": ""}), 200
+        return jsonify({"message": "Login successful"}), 200
 
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -108,7 +173,7 @@ def get_nearby_clinics():
         # Get latitude, longitude, and radius from query parameters
         lat = request.args.get("lat")
         lng = request.args.get("lng")
-        radius = request.args.get("radius", 5000)  # Default radius is 5km
+        radius = request.args.get("radius", 5000)  
 
         if not lat or not lng:
             return jsonify({"error": "Latitude and longitude are required"}), 400
@@ -120,9 +185,9 @@ def get_nearby_clinics():
         params = {
             "location": f"{lat},{lng}",
             "radius": radius,
-            "type": "hospital",  # Fetch hospitals or clinics
+            "type": "hospital", 
             "keyword": "skin dermatology", 
-            "key": os.environ.get("GOOGLE_MAPS_API_KEY"),  # Use environment variable for API key
+            "key": os.environ.get("GOOGLE_MAPS_API_KEY"),  
         }
 
         # Make the API request

@@ -1,3 +1,4 @@
+/* eslint-disable no-unused-vars */
 import React, { useState, useEffect } from "react";
 import {
   Upload,
@@ -20,6 +21,10 @@ import { useNavigate } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import NearbyClinics from "./Nearbyclinics";
+import SettingsPage from "./Settings";
+import { db } from "../firebase-config";
+import { collection, addDoc, serverTimestamp } from "firebase/firestore";
+import ScanHistory from "./ScanHistory";
 
 // Animated particle component from HomePage
 const Particle = ({ size, delay, duration, x, y }) => {
@@ -301,6 +306,7 @@ const Dashboard = () => {
   const [showHelpSupport, setShowHelpSupport] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [activeComponent, setActiveComponent] = useState("default");
+  const [analysisResult, setAnalysisResult] = useState(null);
 
   const navigate = useNavigate();
 
@@ -313,6 +319,80 @@ const Dashboard = () => {
     x: Math.random() * 100,
     y: Math.random() * 100,
   }));
+
+  const saveScanToHistory = async (imageData, detectedDisease, recommendation) => {
+    try {
+      let userId = null;
+      
+      // Try to get the user ID from the user object in localStorage
+      try {
+        const userString = localStorage.getItem("user");
+        console.log("User string from localStorage:", userString);
+        
+        if (userString && userString !== "undefined" && userString !== "null") {
+          const currentUser = JSON.parse(userString);
+          if (currentUser && currentUser.uid) {
+            userId = currentUser.uid;
+            console.log("Using user ID from user object:", userId);
+          }
+        }
+      } catch (parseError) {
+        console.error("Error parsing user JSON:", parseError);
+      }
+      
+      // If no user ID found, try using authToken
+      if (!userId) {
+        userId = localStorage.getItem("authToken");
+        console.log("Using authToken as user ID:", userId);
+      }
+      
+      // As a last resort, check if we have an email we can use as ID
+      if (!userId) {
+        const email = localStorage.getItem("userEmail");
+        if (email && email !== "undefined" && email !== "null") {
+          userId = email;
+          console.log("Using email as user ID:", userId);
+        }
+      }
+  
+      if (!userId) {
+        console.error("No user ID found for saving scan history");
+        throw new Error("User not authenticated. Please log in before scanning.");
+      }
+  
+      // Check if the image data is valid
+      if (!imageData) {
+        console.error("No image data provided");
+        throw new Error("No image data to save");
+      }
+  
+      // Log the data being saved (without logging the entire image data)
+      console.log("Saving scan with data:", {
+        userId,
+        detectedDisease,
+        hasRecommendation: !!recommendation,
+        imageDataLength: imageData.length
+      });
+  
+      const scanHistoryRef = collection(db, "scanHistory");
+      const docRef = await addDoc(scanHistoryRef, {
+        userId: userId,
+        imageUrl: imageData,
+        detectedDisease: detectedDisease || "unknown",
+        recommendation:
+          recommendation ||
+          "Consider consulting with a dermatologist for a professional diagnosis and treatment plan.",
+        timestamp: serverTimestamp(),
+        clientTimestamp: new Date() // Fallback timestamp in case serverTimestamp fails
+      });
+  
+      console.log("Scan saved to history successfully with ID:", docRef.id);
+      return docRef.id; // Return the ID for confirmation
+    } catch (error) {
+      console.error("Error saving scan to history:", error.message, error.stack);
+      throw error; // Re-throw to handle in the calling function
+    }
+  };
 
   const [userName, setUserName] = useState("");
   useEffect(() => {
@@ -349,13 +429,57 @@ const Dashboard = () => {
     }
   };
 
-  const handleAnalyze = () => {
+  const handleAnalyze = async () => {
     if (selectedImage) {
       setIsAnalyzing(true);
-      setTimeout(() => {
+
+      try {
+        // Create form data to send the image
+        const formData = new FormData();
+        formData.append("image", selectedImage);
+
+        // Make API call to your backend
+        const response = await fetch(
+          "http://localhost:5000/disease-detection",
+          {
+            method: "POST",
+            body: formData,
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error("Failed to analyze image");
+        }
+
+        const result = await response.json();
+        setAnalysisResult(result);
+
+        // Convert image to base64 data URL for storage
+        const reader = new FileReader();
+        reader.readAsDataURL(selectedImage);
+        reader.onloadend = () => {
+          // Save scan to history with the base64 data
+          saveScanToHistory(
+            reader.result,
+            result.predicted_condition,
+            result.recommendation
+          );
+        };
+
         setIsAnalyzing(false);
         setShowResults(true);
-      }, 2000); // Simulate processing delay
+      } catch (error) {
+        console.error("Error analyzing image:", error);
+        setIsAnalyzing(false);
+        // Show error message to user
+        setMessages([
+          ...messages,
+          {
+            sender: "ai",
+            text: "I'm sorry, there was an error analyzing your image. Please try again.",
+          },
+        ]);
+      }
     }
   };
 
@@ -368,10 +492,11 @@ const Dashboard = () => {
     setIsRecording(!isRecording);
   };
 
-  const handleSendMessage = async () => {
-    if (inputMessage.trim()) {
-      const userMessage = inputMessage.trim();
-      setMessages([...messages, { sender: "user", text: userMessage }]);
+  const handleSendMessage = async (optionalMessage) => {
+    const messageToSend = optionalMessage || inputMessage.trim();
+
+    if (messageToSend) {
+      setMessages([...messages, { sender: "user", text: messageToSend }]);
       setInputMessage("");
 
       // Add a placeholder for the streaming message
@@ -383,7 +508,7 @@ const Dashboard = () => {
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ input: userMessage }),
+          body: JSON.stringify({ input: messageToSend }),
         });
 
         if (!response.ok) {
@@ -401,12 +526,13 @@ const Dashboard = () => {
           aiResponse += decoder.decode(value, { stream: true });
 
           // Update the last AI message with the streamed text
+
           // eslint-disable-next-line no-loop-func
           setMessages((prev) => {
             const updatedMessages = [...prev];
             updatedMessages[updatedMessages.length - 1] = {
               ...updatedMessages[updatedMessages.length - 1],
-              text: aiResponse, // Append the streamed text
+              text: aiResponse,
             };
             return updatedMessages;
           });
@@ -479,14 +605,48 @@ const Dashboard = () => {
           <div className="flex-1 overflow-y-auto">
             <div className="p-4">
               <nav className="space-y-2">
-                <button className="flex items-center space-x-3 text-gray-700 hover:bg-blue-50 hover:text-blue-600 p-3 rounded-lg w-full transition-colors">
-                  <User className="w-5 h-5 flex-shrink-0" />
-                  {!sidebarCollapsed && <span>Profile</span>}
-                </button>
-                <button className="flex items-center space-x-3 text-gray-700 hover:bg-blue-50 hover:text-blue-600 p-3 rounded-lg w-full transition-colors">
+                {sidebarCollapsed ? (
+                  <button className="flex items-center justify-center text-gray-700 hover:bg-blue-50 hover:text-blue-600 p-3 rounded-lg w-full transition-colors">
+                    <span className="text-xl animate-pulse">✨</span>
+                  </button>
+                ) : (
+                  <div
+                    className={`relative overflow-hidden bg-gradient-to-r from-purple-600 to-blue-500 text-white shadow-md p-3 rounded-lg w-full`}
+                  >
+                    <div className="absolute top-0 right-0 w-16 h-16 -mr-1 -mt-6">
+                      <div className="absolute transform-none bg-yellow-400 text-xs font-bold text-purple-900 text-center py-1 right-0 top-8 w-20">
+                        NEW
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center space-x-3">
+                        <div className="flex-shrink-0 w-6 h-6 text-purple-600 flex items-center justify-center">
+                          <span className="animate-pulse">✨</span>
+                        </div>
+                        <div>
+                          <p className="font-bold text-sm">Exciting Features</p>
+                          <p className="text-xs text-purple-100">
+                            Coming this May
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex-shrink-0">
+                        <div className="animate-pulse bg-white bg-opacity-20 px-2 py-1 rounded text-xs">
+                          Stay tuned!
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <button
+                  className="flex items-center space-x-3 text-gray-700 hover:bg-blue-50 hover:text-blue-600 p-3 rounded-lg w-full transition-colors"
+                  onClick={() => setActiveComponent("scanHistory")}
+                >
                   <Camera className="w-5 h-5 flex-shrink-0" />
                   {!sidebarCollapsed && <span>Scan History</span>}
                 </button>
+
                 <button
                   className="flex items-center space-x-3 text-gray-700 hover:bg-blue-50 hover:text-blue-600 p-3 rounded-lg w-full transition-colors"
                   onClick={() => {
@@ -503,7 +663,10 @@ const Dashboard = () => {
                   <HelpCircle className="w-5 h-5 flex-shrink-0" />
                   {!sidebarCollapsed && <span>Help & Support</span>}
                 </button>
-                <button className="flex items-center space-x-3 text-gray-700 hover:bg-blue-50 hover:text-blue-600 p-3 rounded-lg w-full transition-colors">
+                <button
+                  className="flex items-center space-x-3 text-gray-700 hover:bg-blue-50 hover:text-blue-600 p-3 rounded-lg w-full transition-colors"
+                  onClick={() => setActiveComponent("settingspage")}
+                >
                   <Settings className="w-5 h-5 flex-shrink-0" />
                   {!sidebarCollapsed && <span>Settings</span>}
                 </button>
@@ -524,7 +687,7 @@ const Dashboard = () => {
 
         {/* Main Content */}
         <div className="flex-1 overflow-hidden">
-        <header className="bg-white shadow-sm p-4 flex items-center justify-between">
+          <header className="bg-white shadow-sm p-4 flex items-center justify-between">
             <h1 className="text-2xl font-bold text-gray-800">Dashboard</h1>
             <div className="flex items-center space-x-4">
               <div className="w-10 h-10 bg-blue-600 rounded-full flex items-center justify-center text-white font-bold">
@@ -535,6 +698,10 @@ const Dashboard = () => {
           <div className="p-6 overflow-y-auto h-[calc(100vh-70px)]">
             {activeComponent === "nearbyClinics" ? (
               <NearbyClinics />
+            ) : activeComponent === "settingspage" ? (
+              <SettingsPage />
+            ) : activeComponent === "scanHistory" ? (
+              <ScanHistory />
             ) : (
               <div>
                 <div className="p-6 overflow-y-auto h-[calc(100vh-70px)]">
@@ -619,64 +786,62 @@ const Dashboard = () => {
                             Analysis Results
                           </h2>
 
-                          <div className="grid grid-cols-2 gap-6 mb-6">
-                            <div className="flex flex-col items-center">
-                              <CircularProgress percentage={92} />
-                              <p className="text-gray-700 mt-4 font-medium">
-                                Confidence
-                              </p>
-                            </div>
-                            <div className="flex flex-col items-center">
-                              <CircularProgress percentage={75} />
-                              <p className="text-gray-700 mt-4 font-medium">
-                                Severity
-                              </p>
-                            </div>
-                          </div>
-
                           <div className="space-y-4">
                             <div className="bg-blue-50 p-6 rounded-xl">
                               <h3 className="text-lg font-medium text-gray-800 mb-3">
                                 Detected Condition
                               </h3>
-                              <div className="flex justify-between mb-2">
-                                <span className="text-gray-600">
-                                  Seborrheic Dermatitis
-                                </span>
-                                <span className="text-blue-700 font-semibold">
-                                  92%
-                                </span>
-                              </div>
-                              <div className="h-2 bg-blue-100 rounded-full overflow-hidden">
-                                <div
-                                  className="h-full bg-blue-600 transition-all duration-1000"
-                                  style={{ width: "92%" }}
-                                />
+                              <div className="text-gray-800 font-medium text-xl mb-4">
+                                {analysisResult?.predicted_condition
+                                  ?.replace(/_/g, " ")
+                                  .split(" ")
+                                  .map(
+                                    (word) =>
+                                      word.charAt(0).toUpperCase() +
+                                      word.slice(1)
+                                  )
+                                  .join(" ")}
                               </div>
 
-                              <div className="flex justify-between mt-4 mb-2">
-                                <span className="text-gray-600">Psoriasis</span>
-                                <span className="text-blue-700 font-semibold">
-                                  38%
-                                </span>
-                              </div>
-                              <div className="h-2 bg-blue-100 rounded-full overflow-hidden">
-                                <div
-                                  className="h-full bg-blue-600 transition-all duration-1000"
-                                  style={{ width: "38%" }}
-                                />
-                              </div>
-
-                              <div className="mt-6 p-4 bg-blue-100 rounded-lg text-blue-800 text-sm">
+                              <div className="mt-6 p-4 bg-blue-100 rounded-lg text-blue-800">
                                 <p className="font-medium">
                                   Recommended Action:
                                 </p>
-                                <p className="mt-1">
-                                  Consider consulting with a dermatologist for a
-                                  professional diagnosis and treatment plan.
+                                <p className="mt-2">
+                                  {analysisResult?.recommendation ||
+                                    "Consider consulting with a dermatologist for a professional diagnosis and treatment plan."}
                                 </p>
                               </div>
                             </div>
+
+                            <button
+                              onClick={() => {
+                                setMessages([
+                                  ...messages,
+                                  {
+                                    sender: "user",
+                                    text: `Tell me more about ${analysisResult?.predicted_condition?.replace(
+                                      /_/g,
+                                      " "
+                                    )}`,
+                                  },
+                                ]);
+
+                                // Simulate AI response to provide more information about the condition
+                                setTimeout(() => {
+                                  handleSendMessage(
+                                    `Tell me more about ${analysisResult?.predicted_condition?.replace(
+                                      /_/g,
+                                      " "
+                                    )}`
+                                  );
+                                }, 500);
+                              }}
+                              className="w-full py-3 bg-blue-600 hover:bg-blue-700 rounded-xl font-medium text-white shadow-md hover:shadow-lg transition-all flex items-center justify-center"
+                            >
+                              <HelpCircle className="w-5 h-5 mr-2" />
+                              Learn More About This Condition
+                            </button>
                           </div>
                         </div>
                       )}
